@@ -8,6 +8,7 @@ import (
 	"io"
 	"io/fs"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
 	"os"
@@ -90,6 +91,37 @@ var embeddedWeb embed.FS
 // Feed downloads run concurrently; allow larger feeds time to finish.
 var client = &http.Client{Timeout: 18 * time.Second}
 
+// openBrowser opens the page in Edge, falling back to the system default browser.
+func openBrowser(page string) {
+	if runtime.GOOS != "windows" {
+		if runtime.GOOS == "darwin" {
+			_ = exec.Command("open", page).Start()
+		} else {
+			_ = exec.Command("xdg-open", page).Start()
+		}
+		return
+	}
+	candidates := []string{
+		`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
+		`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
+	}
+	for _, edge := range candidates {
+		if _, statErr := os.Stat(edge); statErr != nil {
+			continue
+		}
+		if startErr := exec.Command(edge, "--new-window", page).Start(); startErr == nil {
+			return
+		} else {
+			log.Printf("Edge 启动失败，改用默认浏览器: %v", startErr)
+			break
+		}
+	}
+	// Fall back to the shell's default browser handler.
+	if err := exec.Command("cmd", "/c", "start", "", page).Start(); err != nil {
+		log.Printf("打开浏览器失败: %v", err)
+	}
+}
+
 func main() {
 	mux := http.NewServeMux()
 	mux.HandleFunc("/api/news", handleNews)
@@ -105,35 +137,36 @@ func main() {
 	if addr == "" {
 		addr = ":8080"
 	}
-	if addr == ":8080" {
+	// Double-clicking the exe must always bring up the page, even when an earlier
+	// instance still holds the default port.
+	autoOpen := addr == ":8080"
+	ln, err := net.Listen("tcp", addr)
+	if err != nil && addr == ":8080" {
+		for p := 8081; p <= 8099; p++ {
+			if candidate, e := net.Listen("tcp", fmt.Sprintf(":%d", p)); e == nil {
+				ln, addr, err = candidate, fmt.Sprintf(":%d", p), nil
+				break
+			}
+		}
+	}
+	if err != nil {
+		log.Fatalf("无法监听 %s: %v", addr, err)
+	}
+	log.Printf("AI Radar ready: http://localhost%s", addr)
+	// Loads the leaderboard snapshot from disk before serving, then warms the
+	// categories in the background so opening the page is fast.
+	startLeaderboardScheduler()
+	if autoOpen {
 		go func() {
 			time.Sleep(800 * time.Millisecond)
 			page := strings.TrimSpace(os.Getenv("AI_NEWS_START_URL"))
 			if page == "" {
-				page = "http://localhost:8080/leaderboard.html"
+				page = "http://localhost" + addr + "/"
 			}
-			if runtime.GOOS == "windows" {
-				candidates := []string{
-					`C:\Program Files (x86)\Microsoft\Edge\Application\msedge.exe`,
-					`C:\Program Files\Microsoft\Edge\Application\msedge.exe`,
-				}
-				for _, edge := range candidates {
-					if _, err := os.Stat(edge); err == nil {
-						_ = exec.Command(edge, "--new-window", page).Start()
-						return
-					}
-				}
-				_ = exec.Command("cmd", "/c", "start", "", "microsoft-edge:"+page).Start()
-			} else if runtime.GOOS == "darwin" {
-				_ = exec.Command("open", page).Start()
-			} else {
-				_ = exec.Command("xdg-open", page).Start()
-			}
+			openBrowser(page)
 		}()
 	}
-	log.Printf("AI Radar ready: http://localhost%s", addr)
-	go startLeaderboardScheduler()
-	log.Fatal(http.ListenAndServe(addr, mux))
+	log.Fatal(http.Serve(ln, mux))
 }
 func handleNews(w http.ResponseWriter, r *http.Request) {
 	if r.Method != http.MethodGet {

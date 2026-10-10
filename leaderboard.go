@@ -5,14 +5,40 @@ import (
 	"fmt"
 	"io"
 	"log"
+	"net"
 	"net/http"
 	"net/url"
+	"os"
+	"path/filepath"
 	"sort"
 	"strconv"
 	"strings"
 	"sync"
 	"time"
 )
+
+// Endpoints are variables so tests can point them at a local stub server.
+var (
+	leaderboardRowsEndpoint   = "https://datasets-server.huggingface.co/rows"
+	leaderboardModelsEndpoint = "https://huggingface.co/api/models"
+)
+
+// Leaderboard traffic uses its own client: a slow Hugging Face response must not
+// block the news feeds, and short dial/TLS timeouts stop a VPN-routed connection
+// from hanging before the retry logic can kick in.
+var leaderboardClient = &http.Client{
+	Timeout: 25 * time.Second,
+	Transport: &http.Transport{
+		Proxy:                 http.ProxyFromEnvironment,
+		DialContext:           (&net.Dialer{Timeout: 6 * time.Second, KeepAlive: 30 * time.Second}).DialContext,
+		ForceAttemptHTTP2:     true,
+		MaxIdleConns:          32,
+		MaxIdleConnsPerHost:   8,
+		IdleConnTimeout:       90 * time.Second,
+		TLSHandshakeTimeout:   6 * time.Second,
+		ExpectContinueTimeout: time.Second,
+	},
+}
 
 type LeaderboardCategory struct {
 	ID          string `json:"id"`
@@ -84,30 +110,98 @@ var leaderboardState = struct {
 	Results     map[string]LeaderboardResult
 	Refreshing  bool
 	LastAttempt time.Time
-}{Results: make(map[string]LeaderboardResult)}
+	// Attempts tracks the last fetch start per category so a failing upstream is
+	// retried after a small cooldown instead of on every browser poll.
+	Attempts map[string]time.Time
+}{Results: make(map[string]LeaderboardResult), Attempts: make(map[string]time.Time)}
+
+func leaderboardCacheFile() string {
+	if dir, err := os.UserCacheDir(); err == nil {
+		return filepath.Join(dir, "AI-Radar", "leaderboard-cache.json")
+	}
+	return "leaderboard-cache.json"
+}
+
+func loadLeaderboardCache() {
+	data, err := os.ReadFile(leaderboardCacheFile())
+	if err != nil {
+		return
+	}
+	var results map[string]LeaderboardResult
+	if json.Unmarshal(data, &results) == nil && results != nil {
+		leaderboardState.Lock()
+		leaderboardState.Results = results
+		leaderboardState.Unlock()
+	}
+}
+
+func saveLeaderboardCache() {
+	data, err := json.MarshalIndent(leaderboardState.Results, "", "  ")
+	if err != nil {
+		return
+	}
+	path := leaderboardCacheFile()
+	_ = os.MkdirAll(filepath.Dir(path), 0755)
+	_ = os.WriteFile(path, data, 0644)
+}
+
+func findLeaderboardCategory(id string) (LeaderboardCategory, bool) {
+	for _, category := range leaderboardCategories {
+		if category.ID == id {
+			return category, true
+		}
+	}
+	return LeaderboardCategory{}, false
+}
 
 // Track refreshes per category. One slow Hugging Face category should not block
-// other tabs from loading cached or independent leaderboard data.
+// other tabs from loading cached or independent leaderboard data, and callers can
+// wait on a running refresh through the done channel.
 var leaderboardRefreshing = struct {
 	sync.Mutex
 	items map[string]bool
-}{items: make(map[string]bool)}
+	done  map[string]chan struct{}
+}{items: make(map[string]bool), done: make(map[string]chan struct{})}
+
+// Start-up warm-up concurrency: enough to fill the tab bar quickly, low enough to
+// stay clear of Hugging Face rate limiting.
+const leaderboardWarmWorkers = 3
 
 func startLeaderboardScheduler() {
+	// Load the on-disk snapshot before the HTTP server starts answering requests.
+	loadLeaderboardCache()
 	go func() {
-		// Warm only the default tab at startup; eager fan-out across every HF config
-		// commonly triggers HTTP 429 and makes the entire page appear broken.
-		refreshLeaderboards("agents")
-		ticker := time.NewTicker(24 * time.Hour)
+		warmLeaderboards()
+		ticker := time.NewTicker(6 * time.Hour)
 		defer ticker.Stop()
 		for range ticker.C {
-			for _, category := range leaderboardCategories {
-				refreshLeaderboards(category.ID)
-				// Keep requests spaced out to avoid Hugging Face rate limiting.
-				time.Sleep(5 * time.Second)
-			}
+			warmLeaderboards()
 		}
 	}()
+}
+
+// warmLeaderboards syncs every category in the background so switching tabs is
+// instant instead of waiting for a cold Hugging Face round trip.
+func warmLeaderboards() {
+	sem := make(chan struct{}, leaderboardWarmWorkers)
+	var wg sync.WaitGroup
+	for _, category := range leaderboardCategories {
+		sem <- struct{}{}
+		wg.Add(1)
+		go func(id string) {
+			defer wg.Done()
+			defer func() { <-sem }()
+			wait, _ := startLeaderboardRefresh(id)
+			if wait == nil {
+				return
+			}
+			select {
+			case <-wait:
+			case <-time.After(45 * time.Second):
+			}
+		}(category.ID)
+	}
+	wg.Wait()
 }
 
 func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
@@ -119,35 +213,37 @@ func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	if id == "" {
 		id = "agents"
 	}
-	var category LeaderboardCategory
-	found := false
-	for _, c := range leaderboardCategories {
-		if c.ID == id {
-			category, found = c, true
-			break
-		}
-	}
+	category, found := findLeaderboardCategory(id)
 	if !found {
 		writeJSON(w, http.StatusBadRequest, map[string]any{"error": "未知排行榜分类", "categories": leaderboardCategories})
 		return
 	}
 	leaderboardState.RLock()
 	result, cached := leaderboardState.Results[id]
-	lastAttempt := leaderboardState.LastAttempt
+	lastAttempt := leaderboardState.Attempts[id]
 	leaderboardState.RUnlock()
-	leaderboardRefreshing.Lock()
-	busy := leaderboardRefreshing.items[id]
-	leaderboardRefreshing.Unlock()
 	force := r.URL.Query().Get("refresh") == "1"
-	needsRefresh := (!cached && time.Since(lastAttempt) > 30*time.Second) || (cached && time.Since(result.FetchedAt) > 24*time.Hour)
-	if (force || needsRefresh) && !busy {
-		go refreshLeaderboards(id)
+	stale := cached && time.Since(result.FetchedAt) > 24*time.Hour
+	// A category that just failed should not be retried on every browser poll;
+	// keep a small cooldown so a broken upstream cannot be hammered.
+	cooling := !cached && time.Since(lastAttempt) < 10*time.Second
+	if force || stale || (!cached && !cooling) {
+		wait, _ := startLeaderboardRefresh(id)
+		if !cached && wait != nil {
+			// First visit for this category: wait for real rows instead of returning an
+			// empty table that only fills up on the next poll.
+			select {
+			case <-wait:
+			case <-time.After(12 * time.Second):
+			case <-r.Context().Done():
+			}
+		}
 	}
 	leaderboardState.RLock()
 	result, cached = leaderboardState.Results[id]
 	leaderboardState.RUnlock()
 	leaderboardRefreshing.Lock()
-	busy = leaderboardRefreshing.items[id]
+	busy := leaderboardRefreshing.items[id]
 	leaderboardRefreshing.Unlock()
 	if !cached {
 		result = LeaderboardResult{Items: []LeaderboardItem{}, Category: category}
@@ -160,28 +256,47 @@ func handleLeaderboard(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
-func refreshLeaderboards(categoryID string) {
-	var category LeaderboardCategory
-	found := false
-	for _, candidate := range leaderboardCategories {
-		if candidate.ID == categoryID {
-			category, found = candidate, true
-			break
-		}
-	}
+// startLeaderboardRefresh registers a refresh for one category and runs the fetch
+// in the background. The returned channel is closed when the refresh finishes
+// (nil when the category is unknown); started reports whether this call created it.
+func startLeaderboardRefresh(categoryID string) (wait <-chan struct{}, started bool) {
+	category, found := findLeaderboardCategory(categoryID)
 	if !found {
-		return
+		return nil, false
 	}
 	leaderboardRefreshing.Lock()
 	if leaderboardRefreshing.items[categoryID] {
+		ch := leaderboardRefreshing.done[categoryID]
 		leaderboardRefreshing.Unlock()
-		return
+		return ch, false
 	}
+	ch := make(chan struct{})
 	leaderboardRefreshing.items[categoryID] = true
+	leaderboardRefreshing.done[categoryID] = ch
 	leaderboardRefreshing.Unlock()
 
+	go func() {
+		defer func() {
+			leaderboardRefreshing.Lock()
+			delete(leaderboardRefreshing.items, categoryID)
+			delete(leaderboardRefreshing.done, categoryID)
+			leaderboardRefreshing.Unlock()
+			close(ch)
+		}()
+		runLeaderboardRefresh(category, categoryID)
+	}()
+	return ch, true
+}
+
+// refreshLeaderboards keeps the original fire-and-forget entry point.
+func refreshLeaderboards(categoryID string) {
+	_, _ = startLeaderboardRefresh(categoryID)
+}
+
+func runLeaderboardRefresh(category LeaderboardCategory, categoryID string) {
 	leaderboardState.Lock()
 	leaderboardState.LastAttempt = time.Now()
+	leaderboardState.Attempts[categoryID] = leaderboardState.LastAttempt
 	leaderboardState.Unlock()
 	value, err := fetchLeaderboard(category)
 	now := time.Now()
@@ -200,11 +315,8 @@ func refreshLeaderboards(categoryID string) {
 		value.FetchedAt = now
 		leaderboardState.Results[categoryID] = value
 	}
+	saveLeaderboardCache()
 	leaderboardState.Unlock()
-
-	leaderboardRefreshing.Lock()
-	delete(leaderboardRefreshing.items, categoryID)
-	leaderboardRefreshing.Unlock()
 }
 
 type hfModelEntry struct {
@@ -223,14 +335,14 @@ type hfModelEntry struct {
 func doLeaderboardRequest(req *http.Request) (*http.Response, error) {
 	var lastErr error
 	for attempt := 0; attempt < 3; attempt++ {
-		resp, err := client.Do(req)
+		resp, err := leaderboardClient.Do(req)
 		if err != nil {
 			lastErr = err
 		} else if resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode < 500 {
 			return resp, nil
 		} else {
 			lastErr = fmt.Errorf("Hugging Face 返回 HTTP %d", resp.StatusCode)
-			delay := time.Duration(2<<attempt) * time.Second
+			delay := time.Duration(attempt+1) * time.Second
 			if retryAfter := strings.TrimSpace(resp.Header.Get("Retry-After")); retryAfter != "" {
 				if seconds, parseErr := strconv.Atoi(retryAfter); parseErr == nil && seconds > 0 && seconds < 90 {
 					delay = time.Duration(seconds) * time.Second
@@ -243,7 +355,7 @@ func doLeaderboardRequest(req *http.Request) (*http.Response, error) {
 			continue
 		}
 		if attempt < 2 {
-			time.Sleep(time.Duration(1<<attempt) * time.Second)
+			time.Sleep(time.Duration(attempt+1) * 500 * time.Millisecond)
 		}
 	}
 	return nil, lastErr
@@ -255,11 +367,12 @@ func fetchHuggingFaceTask(task string) ([]hfModelEntry, error) {
 	values.Set("sort", "downloads")
 	values.Set("direction", "-1")
 	values.Set("limit", "100")
-	req, err := http.NewRequest(http.MethodGet, "https://huggingface.co/api/models?"+values.Encode(), nil)
+	req, err := http.NewRequest(http.MethodGet, leaderboardModelsEndpoint+"?"+values.Encode(), nil)
 	if err != nil {
 		return nil, err
 	}
 	req.Header.Set("User-Agent", "AI-Radar/1.3")
+	req.Header.Set("Accept", "application/json")
 	resp, err := doLeaderboardRequest(req)
 	if err != nil {
 		return nil, err
@@ -324,11 +437,12 @@ func fetchLeaderboard(category LeaderboardCategory) (LeaderboardResult, error) {
 	values.Set("split", "latest")
 	values.Set("offset", "0")
 	values.Set("length", "100")
-	req, err := http.NewRequest(http.MethodGet, "https://datasets-server.huggingface.co/rows?"+values.Encode(), nil)
+	req, err := http.NewRequest(http.MethodGet, leaderboardRowsEndpoint+"?"+values.Encode(), nil)
 	if err != nil {
 		return LeaderboardResult{}, err
 	}
 	req.Header.Set("User-Agent", "AI-Radar/1.2")
+	req.Header.Set("Accept", "application/json")
 	resp, err := doLeaderboardRequest(req)
 	if err != nil {
 		return LeaderboardResult{}, err

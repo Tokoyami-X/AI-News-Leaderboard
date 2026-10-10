@@ -1,7 +1,7 @@
-﻿AI Radar Windows Launcher
+AI Radar Windows Launcher
 
 Files:
-- AI-Radar.exe: Windows x64 launcher/server. Double-click starts the local AI news + leaderboard server and opens Microsoft Edge at http://localhost:8080/leaderboard.html.
+- AI-Radar.exe: Windows x64 launcher/server. Double-click starts the local AI news + leaderboard server and opens Microsoft Edge at http://localhost:8080/ (the news page).
 - AI-Radar.ico: custom AI/news icon used by the desktop shortcut.
 
 Desktop shortcut:
